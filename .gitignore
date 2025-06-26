@@ -1,0 +1,35 @@
+*venv*
+
+# Large model files
+*.pth
+*.tar
+*.pth.tar
+*.onnx
+*.tflite
+models/*.pth
+models/*.tar
+models/*.pth.tar
+models/*.onnx
+models/*.tflite
+
+# Cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large binaries
+*.dll
+*.so
+*.dylib
