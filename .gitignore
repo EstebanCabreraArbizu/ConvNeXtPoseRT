@@ -1,4 +1,8 @@
+# Virtual environments
 *venv*
+venv/
+env/
+.env
 
 # Large model files
 *.pth
@@ -33,3 +37,6 @@ Thumbs.db
 *.dll
 *.so
 *.dylib
+
+# Models temp directory
+models_temp/
