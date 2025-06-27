@@ -32,6 +32,7 @@ import argparse
 import warnings
 import threading
 import queue
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 from collections import deque
@@ -237,18 +238,58 @@ def detect_optimized_hardware():
     else:
         return 'cpu_optimized'
 
+def convert_yolo_to_onnx_optimized(pt_model_path='yolo11n.pt', 
+                                   conf_thresh=0.7, iou_thresh=0.45, img_size=640):
+    """Convierte YOLO a ONNX con optimizaciones específicas"""
+    base_name = pt_model_path.replace('.pt', '')
+    onnx_path = f"{base_name}_optimized_conf{conf_thresh}_iou{iou_thresh}.onnx"
+    
+    if os.path.exists(onnx_path):
+        print(f"✅ ONNX optimizado existente: {onnx_path}")
+        return onnx_path
+    
+    print(f"🔄 Convirtiendo {pt_model_path} a ONNX optimizado...")
+    try:
+        from ultralytics import YOLO
+        model = YOLO(pt_model_path)
+        
+        exported_path = model.export(
+            format='onnx', 
+            imgsz=img_size, 
+            optimize=True, 
+            dynamic=False, 
+            simplify=True, 
+            opset=13,  # Opset más reciente
+            nms=True,
+            conf=conf_thresh, 
+            iou=iou_thresh, 
+            max_det=100  # Reducido para velocidad
+        )
+        
+        if exported_path != onnx_path:
+            os.rename(exported_path, onnx_path)
+        
+        print(f"✅ ONNX optimizado creado: {onnx_path}")
+        return onnx_path
+        
+    except Exception as e:
+        print(f"❌ Error en conversión optimizada: {e}")
+        raise
+
+
 class ProductionYOLODetector:
     """Detector YOLO optimizado pero estable"""
     
     def __init__(self, model_path: str = 'models/yolo11n.pt', input_size: int = 320):
-        self.model_path = model_path
+        self.model_path = convert_yolo_to_onnx_optimized(model_path, img_size = input_size)
         self.input_size = input_size
         self.detector = None
         self.frame_count = 0
         self.last_detections = []
         self.detection_cache = {}
-        
         self._initialize()
+        self.warmup()
+        
     
     def _initialize(self):
         if not YOLO_AVAILABLE:
@@ -272,21 +313,86 @@ class ProductionYOLODetector:
             if model_path is None:
                 logger.warning(f"⚠️ YOLO model not found at {self.model_path}")
                 return
-            
-            self.detector = YOLO(str(model_path))
-            # Configure for optimal CPU performance
-            self.detector.overrides['imgsz'] = self.input_size
-            self.detector.overrides['half'] = False
-            self.detector.overrides['device'] = 'cpu'
+            providers = []
+            session_options = ort.SessionOptions()
+
+            if torch.cuda.is_available():
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                cuda_provider = ('CUDAExecutionProvider', {
+                    'device_id': 0,
+                    'arena_extend_strategy': 'kSameAsRequested' if gpu_memory < 6 else 'kNextPowerOfTwo',
+                    'gpu_mem_limit': int(gpu_memory*0.6*1024**3),
+                    'cdunn_conv_algo_search': 'HEURISTIC',
+                    'do_copy_in_default_stream': True,
+                })
+                providers.append(cuda_provider)
+                session_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+                session_options.inter_op_num_threads = min(2, os.cpu_count())
+                session_options.intra_op_num_threads = min(4, os.cpu_count())
+                logger.info("🚀 YOLO configurado para GPU de alto rendimiento")
+            else:
+                # Configuración CPU optimizada
+                session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                session_options.inter_op_num_threads = 1
+                session_options.intra_op_num_threads = min(4, os.cpu_count())
+                print("🚀 YOLO configurado para CPU optimizado")
+                providers.append('CPUExecutionProvider')
+            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self.session = ort.InferenceSession(self.model_path, providers = providers, sess_options = session_options)
+            self.input_name = self.session.get_inputs()[0].name
+            self.input_shape = self.session.get_inputs()[0].shape
+            self.output_names = [output.name for output in self.session.get_outputs()]
+            self.img_size = self.input_shape[2]
+
+            # self.detector = YOLO(str(model_path))
+            # # Configure for optimal CPU performance
+            # self.detector.overrides['imgsz'] = self.input_size
+            # self.detector.overrides['half'] = False
+            # self.detector.overrides['device'] = 'cpu'
             
             logger.info("✅ Production YOLO initialized: %s (size: %d)", model_path.name, self.input_size)
         except Exception as e:
             logger.error("❌ YOLO initialization failed: %s", e)
-    
+    def warmup(self):
+        """Pre-calentar con número de iteraciones adaptativo"""
+        print("🔥 Pre-calentando YOLO adaptativo...")
+        dummy_input = np.random.rand(*self.input_shape).astype(np.float32)
+        
+        warmup_iterations = 5 if torch.cuda.is_available() else 3
+        for _ in range(warmup_iterations):
+            self.session.run(self.output_names, {self.input_name: dummy_input})
+        print("✅ YOLO adaptativo pre-calentado")
+
+    def preprocess_frame_adaptive(self, frame:np.ndarray):
+        """Preprocesamiento adaptativo según hardware"""
+        h, w = frame.shape[:2]
+        scale = min(self.img_size / w, self.img_size / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        
+        # Interpolación adaptativa
+        interpolation = cv2.INTER_LINEAR if torch.cuda.is_available() else cv2.INTER_NEAREST
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=interpolation)
+        
+        # Padding optimizado
+        pad_w = (self.img_size - new_w) // 2
+        pad_h = (self.img_size - new_h) // 2
+        
+        padded = cv2.copyMakeBorder(
+            resized, pad_h, self.img_size - new_h - pad_h, 
+            pad_w, self.img_size - new_w - pad_w,
+            cv2.BORDER_CONSTANT, value=(114, 114, 114)
+        )
+        
+        # Conversión optimizada
+        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+        normalized = rgb.astype(np.float32) / 255.0
+        input_tensor = np.transpose(normalized, (2, 0, 1))[None, ...]
+        
+        return input_tensor, scale, pad_w, pad_h
     def detect_persons(self, frame: np.ndarray, detection_freq: int = 4, 
-                      conf_threshold: float = 0.4) -> List[List[int]]:
+                      conf_threshold: float = 0.7) -> List[List[int]]:
         """Detección con cache optimizado"""
-        if self.detector is None:
+        if self.session is None:
             return []
         
         self.frame_count += 1
@@ -297,32 +403,31 @@ class ProductionYOLODetector:
         
         try:
             # Optimization: resize frame if too large for faster detection
-            detection_frame = frame
-            scale_factor = 1.0
+            input_tensor, scale, pad_w, pad_h = self.preprocess_frame_adaptive(frame)
+            outputs = self.session.run(self.output_names, {self.input_name: input_tensor})
+
+            if len(outputs) == 0 or outputs[0].size == 0:
+                return [[]]
             
-            if frame.shape[0] > 640:
-                scale_factor = 640 / frame.shape[0]
-                new_height = int(frame.shape[0] * scale_factor)
-                new_width = int(frame.shape[1] * scale_factor)
-                detection_frame = cv2.resize(frame, (new_width, new_height))
+            detections = outputs[0][0] #
+            person_mask = (detections[:, 5] == 0) & (detections[:, 4] >= conf_threshold)
+            person_detections = detections[person_mask]
+
+            if len(person_detections) == 0:
+                return [[]]
             
-            results = self.detector(detection_frame, verbose=False)
-            
-            persons = []
-            for result in results:
-                for box in result.boxes:
-                    if box.cls == 0 and box.conf >= conf_threshold:  # Person class
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        
-                        # Scale back to original frame size
-                        if scale_factor != 1.0:
-                            x1, y1, x2, y2 = [coord / scale_factor for coord in [x1, y1, x2, y2]]
-                        
-                        persons.append([int(x1), int(y1), int(x2), int(y2)])
-            
-            self.last_detections = persons
-            return persons
-            
+            boxes = person_detections[:, :4].copy()
+            scores = person_detections[:, 4]
+
+            boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_w) / scale
+            boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_h) / scale
+
+            h, w = frame.shape[:2]
+            boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, w)
+            boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, h)
+            self.last_detections = boxes
+            return boxes
+        
         except Exception as e:
             logger.warning(f"⚠️ Detection failed: {e}")
             return self.last_detections
@@ -619,9 +724,8 @@ class ProductionV4Processor:
             
             # Find RootNet checkpoint
             checkpoint_paths = [
-                ROOT / 'models' / 'rootnet_model.pth',
-                ROOT / 'models' / 'model_opt_S.pth',  # Existing checkpoint
-                ROOTNET_ROOT / 'snapshot_24.pth.tar',
+                ROOT / 'models' / 'snapshot_19.pth.tar',  # Existing checkpoint
+                ROOTNET_ROOT / 'snapshot_19.pth.tar',
             ]
             
             checkpoint_path = None
@@ -635,6 +739,7 @@ class ProductionV4Processor:
                 checkpoint_path = str(ROOT / 'models' / 'model_opt_S.pth')
             
             # Initialize with robust patching from root_wrapper.py
+            from src.root_wrapper import RootNetWrapper
             self.rootnet_processor = RootNetWrapper(
                 rootnet_path=str(ROOTNET_ROOT),
                 checkpoint_path=checkpoint_path
@@ -669,7 +774,7 @@ class ProductionV4Processor:
         persons = self.yolo_detector.detect_persons(
             frame, 
             self.config['detection_freq'],
-            conf_threshold=0.4
+            conf_threshold=0.7
         )
         detection_time = time.time() - detection_start
         
